@@ -31,6 +31,8 @@ window to resume execution. All subsequent steps are automated again.
 """
 
 import os
+import json
+from collections import defaultdict
 
 import numpy as np
 import dcmri as dc #for dce images
@@ -38,15 +40,14 @@ import napari #useful software for viewing and manually editing images (2D, 3D, 
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import dbdicom as db #working with DICOM datasets
+import dbdicom.dataset as dbdataset
 import miblab #for downloading and uploading data/functions from miblab.org on github
 import mdreg #motion correction - particularly useful for non-breathold lung scans and surrounding organs, also cardiac imaging.
 import vreg #Facilitate alignment and slicing of 3D (and hence 4D with other packages) datasets with different positions and orientations.
+import pydicom
 import pydmr #working with .dmr (dynamic MR) data, a dynamic type of csv flie including ROI curve data, pulse sequence parameters, subject properties, and their standard deviations,  
 from totalsegmentator.map_to_binary import class_map
 from IPython.display import Image, display
-
-from case_studies.utils.stats import mask_stats #masks isolate areas of interest for analysis, e.g. sorting for thresholding. mask_stats gives mask values
-
 
 def draw_mask(array: np.ndarray, mask=None, name='ROI', contrast_limits=None) -> np.ndarray: #drawing the mask is kept the same: useful for all types of images
     # Ensure it's a numpy array
@@ -117,6 +118,43 @@ def draw_mask_notebook(array: np.ndarray, mask=None, name='ROI', contrast_limits
 
 def harmonize_data(datapath, data):
 
+    fa_series = {}
+    missing_flip_angles = []
+    for fa in [2, 4, 10, 20, 30]:
+        matches = db.series(datapath, contains=f'flip {fa}')
+        if matches:
+            fa_series[fa] = matches[0]
+        else:
+            missing_flip_angles.append(fa)
+
+    if missing_flip_angles: # applies if even one perfusion flip angle is missing, useful check with fa 4 having a slightly different file name than the others (missing an underscore before the number)
+        raise ValueError(
+            f"No VFA series found for flip angle(s): {missing_flip_angles}."
+        )
+
+    dce = db.series(datapath, contains='WITH CONTRAST')
+    if not dce:
+        dce = db.series(datapath, contains='DISCO')
+    if not dce:
+        raise ValueError(
+            "No DCE series found. Expected a series name containing "
+            "'WITH CONTRAST' or 'DISCO'." #change this, add a separate one for disco
+        )
+
+    with open(os.path.join(datapath, 'dbtree.json'), encoding='utf-8') as f:
+        dbtree = json.load(f)
+
+    def source_series_label(series):
+        source_files = db.register.files(dbtree, series)
+        if not source_files:
+            raise ValueError(f"No DICOM files found for series: {series}.")
+        series_description = series[-1][0]
+        source_folder = os.path.relpath(source_files[0], datapath).split(os.sep, 1)[0]
+        return (
+            f"SeriesDescription: {series_description}; "
+            f"source folder: {source_folder}"
+        )
+
     # If the outputs exists, delete them first
     vfa_series = data + ['3D-VFA']
     dce_series = data + ['3D-DCE'] #vfa and dce data both used in rectify
@@ -125,15 +163,18 @@ def harmonize_data(datapath, data):
 
     # Merge VFA into 1 series to simplify analysis
     # Write the correct flip angle in each series
-    for fa in [2,4,10,20,30]: #flip angles used in RECTIFY 
-        fa_series = db.series(datapath, contains=f'flip {fa}')[0]
-        fa_series_copy = db.copy(fa_series)
-        db.edit(fa_series_copy, {'FlipAngle':fa})
-        db.move(fa_series_copy, vfa_series) # bug not removing empty folders
+    for fa, source_series in fa_series.items():
+        staged_series = data + [f'3D-VFA-{fa}']
+        db.delete(staged_series, not_exists_ok=True)
+        print(f"Merging {source_series_label(source_series)}")
+        db.copy(source_series, staged_series)
+        db.edit(staged_series, {'FlipAngle':fa})
+        db.move(staged_series, vfa_series)
 
     # Merge DCE into one single series
-    dce = db.series(datapath, contains='WITH CONTRAST')
-    [db.copy(phase, dce_series) for phase in dce]
+    for phase in dce:
+        print(f"Merging {source_series_label(phase)}")
+        db.copy(phase, dce_series)
     # Store timing info in acquisition time in seconds (miblab default)
     acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
     db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
@@ -264,6 +305,153 @@ def edit_autosegmented_colorectal_notebook(maps, masks):
 
     print('Finished editing colon segmentations. Edited masks are saved in the MASKS series.')
 
+#Defining log fit used in ADC equation, ADC=-(1/b_1-b_0) * log(S_1/S_0)
+#Rearrange to S_1=S_0*e^(-b*ADC) so the slope of log(S_1/S_0) against the b-values gives -ADC
+def _fit_adc(signal, b_values):
+    b_values = np.asarray(b_values, dtype=float) #convert b-values to numpy arrays
+    if signal.shape[-1] != b_values.size or b_values.size < 2: #check that the number of signal values matches the number of b-values and theres at least 2 b-values
+        raise ValueError("ADC fitting requires at least two signal values with matching b-values.")
+    if np.any(~np.isfinite(b_values)) or np.any(b_values < 0): #rejects NAN, infinite, or neg b-values
+        raise ValueError("Diffusion b-values must be finite and non-negative.")
+
+    valid = np.all(np.isfinite(signal) & (signal > 0), axis=-1) #make boolean mask for whether locations have only finite, positive signals
+    log_signal = np.zeros(signal.shape, dtype=float) #create an array to put log(signal) the same shape as the signal array
+    np.log(signal, out=log_signal, where=np.isfinite(signal) & (signal > 0)) #ignoring NAN, infinite, and negative values so logarithm is mathematicallly possible, performs the logarithmic transformation
+    centered_b = b_values - np.mean(b_values) #b_1-b_0
+    denominator = np.sum(centered_b**2) #sets (b_1-b_0)**2 as the denominator for linear regression
+    if denominator == 0: #check for different b-values
+        raise ValueError("ADC fitting requires at least two distinct b-values.")
+
+    slope = np.sum((log_signal - np.mean(log_signal, axis=-1, keepdims=True))* centered_b, axis=-1,) / denominator #performing the equation from previous variables, 
+    adc = np.zeros(signal.shape[:-1], dtype=np.float32) #makes ADC output array, shape[-1] denotes the last dimension of the adc_map array (rows, columns, slices, b-value measurements) so returns rows, colmns,and slices but not b-values
+    adc[valid] = np.maximum(-slope[valid], 0) #sets negative ADC values to 0
+    return adc
+
+#Apparent diffusion coefficient maps for dwi images against T2 images
+def adc_map(datapath, maps):
+    """Create an ADC map from the axial DWI series in its native image space."""
+    dwi_series = db.series(datapath, desc='Ax DWI') #will update this to fetch more in later datasets if they have more than one plane of dwi images
+    if len(dwi_series) != 1: #also upadte this when/if >1 dim
+        raise ValueError(
+            f"Expected exactly one series named 'Ax DWI'; found {len(dwi_series)}."
+        )
+    if not db.series(maps[:3]): #chacks resultspath, SUBJ, and 'Maps' are present/valid
+        raise ValueError(
+            "The Maps study is empty. Run compute_descriptive_maps(DATA, MAPS) "
+            "before adc_map so dbdicom can create the ADC series."
+        )
+
+    images_by_slice = defaultdict(lambda: defaultdict(list)) #group image arrays by MRI slice selection gradient
+    baseline_datasets = {}
+    orientation = None #these 3 lines are just starting values changed by images and data
+    pixel_shape = None
+    missing_b_locations = set() #track unknown b-value slices
+    explicit_zero_locations = set() #track slices with b=0
+
+    #read images and check their orientation, ensuring there are no unexpected image rotations 
+    for filename in db.files(dwi_series[0]): 
+        ds = pydicom.dcmread(filename)
+        image_orientation = np.asarray(ds.ImageOrientationPatient, dtype=float)
+        if orientation is None:
+            orientation = image_orientation
+        elif not np.allclose(image_orientation, orientation, atol=1e-5):
+            raise ValueError("Ax DWI images do not share a consistent orientation.")
+
+        #calculate slice position wrt scan direction
+        normal = np.cross(orientation[:3], orientation[3:]) 
+        normal /= np.linalg.norm(normal)
+        slice_location = round(
+            float(np.dot(np.asarray(ds.ImagePositionPatient, dtype=float), normal)),
+            3,
+        )
+
+        #read b and perform checks for 0 and missing values
+        raw_b_value = getattr(ds, 'DiffusionBValue', None)
+        if raw_b_value is None:
+            b_value = 0.0
+            missing_b_locations.add(slice_location)
+        else:
+            b_value = float(raw_b_value)
+            if b_value == 0:
+                explicit_zero_locations.add(slice_location)
+
+        #read pixel data and filter for 2D images only
+        image = dbdataset.pixel_data(ds)
+        if image.ndim != 2:
+            raise ValueError("Ax DWI series must contain single-frame 2D images.")
+        if pixel_shape is None:
+            pixel_shape = image.shape
+        elif image.shape != pixel_shape:
+            raise ValueError("Ax DWI images do not share a consistent matrix size.")
+
+        ##group images in slice and b-value groups
+        images_by_slice[slice_location][b_value].append(image)
+        if b_value == 0:
+            baseline_datasets[slice_location] = ds
+
+    #check each series containsthese slice and b-value groups
+    if not images_by_slice:
+        raise ValueError("The 'Ax DWI' series contains no images.")
+    slice_locations = sorted(images_by_slice)
+    b_values = sorted({b for per_slice in images_by_slice.values() for b in per_slice})
+    if 0.0 not in b_values or len(b_values) < 2:
+        raise ValueError("Ax DWI must contain a b=0 baseline and at least one nonzero b-value.")
+    if missing_b_locations and ( #allows for missing b-value from dicom but not b=0
+        explicit_zero_locations
+        or missing_b_locations != set(slice_locations)
+        or any(len(images_by_slice[location][0.0]) != 1 for location in slice_locations)
+    ):
+        raise ValueError(
+            "Some DWI images lack DiffusionBValue; they can only be treated as "
+            "b=0 when there is exactly one such image per slice and no explicit b=0 images."
+        )
+
+    #check each slice has the same b-values and repeat counts
+    expected_b_values = set(b_values)
+    replicate_counts = {}
+    for location in slice_locations:
+        per_slice = images_by_slice[location]
+        if set(per_slice) != expected_b_values:
+            raise ValueError("Every DWI slice must contain images for the same b-values.")
+        for b_value in b_values:
+            count = len(per_slice[b_value])
+            if b_value in replicate_counts and replicate_counts[b_value] != count:
+                raise ValueError(
+                    f"Inconsistent number of images for b={b_value:g} across DWI slices."
+                )
+            replicate_counts[b_value] = count
+
+    #ensures a 3D/4D array with >1 slice is used
+    if len(slice_locations) < 2:
+        raise ValueError("At least two DWI slices are required to create a 3D ADC map.")
+    slice_spacing = np.diff(slice_locations)
+    if not np.allclose(slice_spacing, np.median(slice_spacing), rtol=1e-3, atol=1e-3): #relative and absolute tolerance are 0.1% of the mean spacing
+        raise ValueError("Ax DWI slice positions are not regularly spaced.")
+
+    #fit ADC eqn
+    signal_slices = []
+    for location in slice_locations:
+        mean_signals = [
+            np.mean(images_by_slice[location][b_value], axis=0)
+            for b_value in b_values
+        ]
+        signal_slices.append(np.stack(mean_signals, axis=-1))
+    signal = np.stack(signal_slices, axis=2)
+    adc = _fit_adc(signal, b_values)
+
+    #set spatial info
+    first_slice = baseline_datasets[slice_locations[0]]
+    affine = dbdataset.affine(first_slice) #liunear transformation followed by translation
+    if np.dot(affine[:3, 2], normal) < 0: #matrix multiplication of the first 3 rows and 2nd column of the affine matrix with normal matrix
+        adc = adc[:, :, ::-1]
+        affine[:3, 2] *= -1
+    affine[:3, 2] = normal * float(np.median(slice_spacing))
+
+    #write volume and delete any exisiing duplicates
+    adc_series = maps + ['ADC']
+    db.delete(adc_series, not_exists_ok=True)
+    db.write_volume((adc, affine), adc_series, verbose=0)
+    print("Finished creating ADC map in native axial DWI space (units: mm^2/s).")
 
 def draw_arterial_inputs(maps, masks):
 
@@ -356,6 +544,26 @@ def view_vfa_notebook(maps):
     vol = db.volume(maps + [map], 'FlipAngle')
     viewer = napari.Viewer()
     viewer.add_image(vol.values.T, name=map, contrast_limits=[0, 1000])
+
+
+def view_adc_notebook(maps):
+    """Display the ADC map in napari; run this from a notebook with %gui qt."""
+    adc_vol = db.volume(maps + ['ADC'])
+    positive_adc = adc_vol.values[np.isfinite(adc_vol.values) & (adc_vol.values > 0)]
+    if positive_adc.size == 0:
+        raise ValueError("The ADC map contains no positive finite values to display.")
+
+    contrast_max = float(np.percentile(positive_adc, 99))
+    voxel_spacing = np.linalg.norm(adc_vol.affine[:3, :3], axis=0)[::-1]
+    viewer = napari.Viewer()
+    viewer.add_image(
+        adc_vol.values.T,
+        name='ADC (mm^2/s)',
+        scale=voxel_spacing,
+        contrast_limits=(0, contrast_max),
+        colormap='gray',
+    )
+    return viewer
 
 
 def vfa_fit(maps):
@@ -753,6 +961,7 @@ def view_png(png_file):
 
 
 def pixel_averages_model_based(maps, masks, subj, build_path):
+    from rectify.utils.stats import mask_stats
 
     fb_image = db.volume(maps + ['Fb_model']).values
     vb_image = db.volume(maps + ['vb_model']).values
@@ -803,6 +1012,7 @@ if __name__=='__main__':
 
     harmonize_data(DATAPATH, DATA)
     compute_descriptive_maps(DATA, MAPS)
+    adc_map(DATAPATH, MAPS)
     autosegment_colorectal(MAPS, MASKS)
     edit_autosegmented_colorectal(MAPS, MASKS)
     draw_arterial_inputs(MAPS, MASKS)
