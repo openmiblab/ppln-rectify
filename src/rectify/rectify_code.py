@@ -386,6 +386,7 @@ def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
         if fa_series == []:
             missing_fa.append(fa)
         else:
+            fa_series = fa_series[0]
             patient_id = fa_series[1]
             new_series = [resultspath, patient_id, study, f'3D-VFA ({fa})'] #vfa and dce data both used in rectify
             db.copy(fa_series, new_series)
