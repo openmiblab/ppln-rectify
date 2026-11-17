@@ -32,6 +32,7 @@ window to resume execution. All subsequent steps are automated again.
 
 import os
 import json
+import re
 from collections import defaultdict
 
 import numpy as np
@@ -59,24 +60,11 @@ def draw_mask(array: np.ndarray, mask=None, name='ROI', contrast_limits=None) ->
     else:
         mask = np.asarray(mask).T
 
-    # Start the napari viewer
-    viewer = napari.Viewer()
-    viewer.add_image(array, name='Data', blending="additive", contrast_limits=contrast_limits)
-
-    # Add an empty labels layer for drawing
-    labels_layer = viewer.add_labels(mask, name=name)
-
-    # Set brush tool as active and radius = 6
-    viewer.layers.selection.active = labels_layer
-    labels_layer.mode = 'paint'
-    labels_layer.brush_size = 6
-
-    # Start the interactive GUI
-    napari.run()
-
-    # After closing napari, extract the mask
-    mask = (labels_layer.data > 0).astype(np.uint16)
-
+    viewer = napari.Viewer() # start the napari viewer
+    viewer.add_image(array, name='Data', blending="additive", contrast_limits=contrast_limits) #putting in bare minimum for variables
+    labels_layer = viewer.add_labels(mask, name=name) # add an empty labels layer for drawing/segmentation
+    napari.run()  # start napari
+    mask = (labels_layer.data > 0).astype(np.uint16) #extract mask only after closing napari
     return mask.T
 
 
@@ -116,14 +104,194 @@ def draw_mask_notebook(array: np.ndarray, mask=None, name='ROI', contrast_limits
     return mask.T
 
 
+def manually_segment_ax_t2(datapath, build_path):
+    import math
+
+    ax_t2_series = db.series(datapath, desc="Ax T2 frFSE") #using dbdicom to find the dicom file with series description corresponding to desc, might need changed for each patient if naming conventions change 
+    if len(ax_t2_series) != 1: #ensures there are no duplicates as the notebook creates copies of dicom file folders sometimes
+        raise ValueError(
+            f"Expected one Ax T2 frFSE series in {datapath}, "
+            f"found {len(ax_t2_series)}."
+        )
+
+    ax_t2_volume = db.volume(ax_t2_series[0]) #convert series to 3D volume
+    ax_t2_stack = np.asarray(ax_t2_volume.values.T) #asarray changes the volume to a numpy array then transpose so the numpy array is slices first (slice, row, column) so slices can be segmented iteratively
+    if ax_t2_stack.ndim != 3: #Ensures all 3 dimensions (i.e. multiple slices) are used
+        raise ValueError(
+            f"Expected a 3D Ax T2 volume, got shape {ax_t2_stack.shape}."
+        )
+
+    viewer = napari.Viewer() #opens the 3D array in Napari
+    viewer.add_image(ax_t2_stack, name="Ax T2 frFSE")
+    labels_layer = viewer.add_labels( #assign layer to segmentyed pixels
+        np.zeros(ax_t2_stack.shape, dtype=np.uint8),
+        name="axial T2 manual segmentation",
+    )
+    labels_layer.selected_label = 1
+    viewer.layers.selection.active = labels_layer
+    labels_layer.mode = "paint"
+   
+    viewer.show(block=True) # wait until the user closes Napari before copying and saving the labels.
+    ax_t2_labels = labels_layer.data.copy()
+    viewer.close()
+
+    ax_t2_mask = ax_t2_labels > 0
+    print(f"Painted voxels: {np.count_nonzero(ax_t2_mask)}")
+    ax_t2_segmented = np.where(
+        ax_t2_mask, ax_t2_stack, 0
+    ).astype(ax_t2_stack.dtype)
+
+    os.makedirs(build_path, exist_ok=True) #ensuring everything goes to the reuslts folder
+    labels_path = os.path.join(build_path, "ax_t2_frFSE_labels.npy") 
+    segmented_path = os.path.join(build_path, "ax_t2_frFSE_segmented.npy")
+    np.save(labels_path, ax_t2_labels) #saves mask
+    np.save(segmented_path, ax_t2_segmented) #saves segmented image
+    print(f"Saved labels to: {labels_path}")
+    print(f"Saved segmented volume to: {segmented_path}")
+
+    edited_slice_indices = np.flatnonzero(np.any(ax_t2_mask, axis=(1, 2)))
+
+    def show_slice_grid(slice_indices, title):
+        columns = 4
+        rows = math.ceil(len(slice_indices) / columns)
+        fig, axes = plt.subplots(
+            rows, columns, figsize=(14, 3.5 * rows), squeeze=False
+        )
+        fig.suptitle(title)
+
+        for slice_index, ax in zip(slice_indices, axes.flat):
+            ax.imshow(ax_t2_stack[slice_index], cmap="gray")
+            overlay = np.ma.masked_where(
+                ~ax_t2_mask[slice_index], ax_t2_mask[slice_index]
+            )
+            ax.imshow(overlay,cmap="viridis",alpha=0.5,vmin=0,vmax=1, interpolation="nearest",) #vmax is 1 and not 255 as gradient not useful
+            ax.set_title(f"Axial T2 slice {slice_index + 1}")
+            ax.axis("off")
+
+        for ax in axes.flat[len(slice_indices):]:
+            ax.axis("off")
+
+        fig.tight_layout()
+        plt.show()
+
+    show_slice_grid(
+        range(ax_t2_stack.shape[0]),
+        "",
+    )
+
+    if edited_slice_indices.size == 0:
+        print("No slices have been edited.")
+    else:
+        show_slice_grid(edited_slice_indices, "Edited Ax T2 slices")
+
+    return ax_t2_labels
+
+def manually_segment_ax_dwi(datapath, build_path): #add to this if more dwi planes are used, especially sagittal. Coronal still may not be used for segmentation or analysis
+    import math
+
+    ax_dwi_series = db.series(datapath, desc="Ax DWI") #again using dbdicom to find the dicom file with series description, these can all be easily viewed in the notebook
+    if len(ax_dwi_series) != 1: #ensures there are no duplicates as the notebook creates copies of dicom file folders sometimes (again)
+        raise ValueError(
+            f"Expected one Ax DWI series in {datapath}, "
+            f"found {len(ax_dwi_series)}."
+        )
+
+    ax_dwi_volume = db.volume(ax_dwi_series[0]) #3D volume
+    ax_dwi_stack = np.asarray(ax_dwi_volume.values.T) #transpose so the numpy array is slices first (slice, row, column) so slices can be segmented iteratively
+    if ax_dwi_stack.ndim != 3: #Ensures all 3 dimensions (rows slices) are used
+        raise ValueError(
+            f"Expected a 3D Ax DWI volume, got shape {ax_dwi_stack.shape}." #.shape returns the dimensions of the array, e.g. (slices, rows, columns) (slices first when transposed which is what we want)
+        )
+
+    viewer = napari.Viewer() #opens the 3D array in napari
+    viewer.add_image(ax_dwi_stack, name="Ax DWI") #adds the data as an image layer to napari
+    labels_layer = viewer.add_labels( #assign layer to segmented pixels
+        np.zeros(ax_dwi_stack.shape, dtype=np.uint8), #sets all pixel/voxel values to 0, to be differentiated from painted/segmentated values of 1 later
+        name="axial DWI manual segmentation",
+    )
+    labels_layer.selected_label = 1 #see np.zeros comment, defaults to painting on the first layer
+    viewer.layers.selection.active = labels_layer
+    labels_layer.mode = "paint"
+   
+    viewer.show(block=True) # wait until I close napari before saving labels.
+    ax_dwi_labels = labels_layer.data.copy() #copy layer labels
+    viewer.close()
+
+    ax_dwi_mask = ax_dwi_labels > 0 #boolean mask where 0 is false and anything else (in this case that can only be 1) as true
+    print(f"Painted voxels: {np.count_nonzero(ax_dwi_mask)}") #just what it says, counting nonzero painted voxels gives segmented voxels
+    ax_dwi_segmented = np.where(ax_dwi_mask, ax_dwi_stack, 0).astype(ax_dwi_stack.dtype) #np.where creates an array of the same shape as the stack array, with values from the stack where the mask is True and 0 elsewhere
+    #.astype ensures that array has the same data type as the stack array
+
+    os.makedirs(build_path, exist_ok=True) #ensuring everything goes to the reuslts folder
+    labels_path = os.path.join(build_path, "ax_dwi_labels.npy") #construct paths for the napari files in the results folder
+    segmented_path = os.path.join(build_path, "ax_dwi_segmented.npy")
+    np.save(labels_path, ax_dwi_labels) #saves mask
+    np.save(segmented_path, ax_dwi_segmented) #saves segmented image
+    print(f"Saved labels to: {labels_path}")
+    print(f"Saved segmented volume to: {segmented_path}")
+
+    edited_slice_indices = np.flatnonzero(np.any(ax_dwi_mask, axis=(1, 2))) # np.any checks each slice for one painted pixel, allows later exclusion of nonpainted slices in the notebook grid
+    #np.flatnonzero retunrs the indices of the slices with painted pixels
+
+    def show_slice_grid(slice_indices, title): #formats the grid of results in the notebook
+        columns = 4
+        rows = math.ceil(len(slice_indices) / columns)
+        fig, axes = plt.subplots(
+            rows, columns, figsize=(14, 3.5 * rows), squeeze=False
+        )
+        fig.suptitle(title) #suptitle is the overall title (super title)
+
+        for slice_index, ax in zip(slice_indices, axes.flat): #pairs slice indices with axis for individual subplots, axes.flat does this by converting the 2D grid to a 1D iterator
+            ax.imshow(ax_dwi_stack[slice_index], cmap="gray") #specify gray or it goes a greenish map that is hard to see where segmentations have been drawn
+            overlay = np.ma.masked_where( #masked array hides unpainted pixels in the overlay
+                ~ax_dwi_mask[slice_index], ax_dwi_mask[slice_index]
+            )
+            ax.imshow(overlay,cmap="viridis",alpha=0.5,vmin=0,vmax=1, interpolation="nearest",) #vmax is 1 and not 255 as gradient not useful
+            ax.set_title(f"Axial DWI slice {slice_index + 1}")
+            ax.axis("off") #hides visible x and y axis labels and lines
+
+        for ax in axes.flat[len(slice_indices):]:
+            ax.axis("off")
+
+        fig.tight_layout()
+        plt.show()
+
+    show_slice_grid(
+        range(ax_dwi_stack.shape[0]), #display every slice in the volume, edited or not. the.shape[0] dentoes slices, 1 would respresent rows and 2 columns
+        "", #make title invisible, can't just delete it as the function requires the title variable so this works just as well
+    )
+
+    if edited_slice_indices.size == 0: #self-explanatory
+        print("No slices have been edited.")
+    else:
+        show_slice_grid(edited_slice_indices, "Edited Ax DWI slices")
+
+    return ax_dwi_labels
+
+
 def harmonize_data(datapath, data):
 
+    all_series = db.series(datapath)
     fa_series = {}
     missing_flip_angles = []
-    for fa in [2, 4, 10, 20, 30]:
-        matches = db.series(datapath, contains=f'flip {fa}')
-        if matches:
+    for fa in [2, 4, 10, 20, 30]: #all present rectify flip angles, these shoudln't need changed
+        matches = [
+            series
+            for series in all_series
+            if re.search(
+                rf'\bflip[\s_]*{fa}(?!\d)',
+                str(series[-1][0]),
+                flags=re.IGNORECASE,
+            )
+            and not str(series[-1][0]).casefold().endswith('_copy')
+        ]
+        if len(matches) == 1:
             fa_series[fa] = matches[0]
+        elif len(matches) > 1:
+            raise ValueError(
+                f"Found multiple source VFA series for flip angle {fa}: "
+                f"{[series[-1][0] for series in matches]}."
+            )
         else:
             missing_flip_angles.append(fa)
 
@@ -132,14 +300,7 @@ def harmonize_data(datapath, data):
             f"No VFA series found for flip angle(s): {missing_flip_angles}."
         )
 
-    dce = db.series(datapath, contains='WITH CONTRAST')
-    if not dce:
-        dce = db.series(datapath, contains='DISCO')
-    if not dce:
-        raise ValueError(
-            "No DCE series found. Expected a series name containing "
-            "'WITH CONTRAST' or 'DISCO'." #change this, add a separate one for disco
-        )
+    dce = db.series(datapath, contains='PERFUSION DISCO')
 
     with open(os.path.join(datapath, 'dbtree.json'), encoding='utf-8') as f:
         dbtree = json.load(f)
@@ -171,15 +332,21 @@ def harmonize_data(datapath, data):
         db.edit(staged_series, {'FlipAngle':fa})
         db.move(staged_series, vfa_series)
 
-    # Merge DCE into one single series
-    for phase in dce:
-        print(f"Merging {source_series_label(phase)}")
-        db.copy(phase, dce_series)
-    # Store timing info in acquisition time in seconds (miblab default)
-    acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
-    db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
+    if dce:
+        # Merge DCE into one single series
+        for phase in dce:
+            print(f"Merging {source_series_label(phase)}")
+            db.copy(phase, dce_series)
+        # Store timing info in acquisition time in seconds (miblab default)
+        acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
+        db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
+    else:
+        print(
+            "No series containing 'PERFUSION DISCO' was found. "
+            "DCE harmonization was skipped."
+        )
 
-    print('Finished harmonizing data. VFA and DCE series are now merged into single series for analysis.')
+    print('Finished harmonizing available data. VFA flip angles are merged into one series.')
 
 
 def view_dce_notebook(data):
@@ -443,9 +610,9 @@ def adc_map(datapath, maps):
     first_slice = baseline_datasets[slice_locations[0]]
     affine = dbdataset.affine(first_slice) #liunear transformation followed by translation
     if np.dot(affine[:3, 2], normal) < 0: #matrix multiplication of the first 3 rows and 2nd column of the affine matrix with normal matrix
-        adc = adc[:, :, ::-1]
-        affine[:3, 2] *= -1
-    affine[:3, 2] = normal * float(np.median(slice_spacing))
+        adc = adc[:, :, ::-1] #if the directions oppose reverse the order of the ADC slices along the third array axis.
+        affine[:3, 2] *= -1 #reverse direction of affine third-axis vector
+    affine[:3, 2] = normal * float(np.median(slice_spacing)) #set the vector up with the median voxel spacing
 
     #write volume and delete any exisiing duplicates
     adc_series = maps + ['ADC']
@@ -453,28 +620,6 @@ def adc_map(datapath, maps):
     db.write_volume((adc, affine), adc_series, verbose=0)
     print("Finished creating ADC map in native axial DWI space (units: mm^2/s).")
 
-def draw_arterial_inputs(maps, masks):
-
-    # Draw right heart and pulmonary artery on SEmax
-    ref_series = maps + ['SEmax']
-    ref_vol = db.volume(ref_series) 
-
-    # # Draw right heart for mdreg
-    # # Not used at this stage
-    # roi = 'input'
-    # mask_array = draw_mask(ref_vol.values, name=roi)  
-    # mask_vol = (mask_array, ref_vol.affine)
-    # mask_series = MASKS + [roi]
-    # db.delete(mask_series, not_exists_ok=True)
-    # db.write_volume(mask_vol, mask_series, ref=ref_series)
-
-    # Draw AIF
-    roi = 'pulmonary_artery'
-    mask_array = draw_mask(ref_vol.values, name=roi)  
-    mask_vol = (mask_array, ref_vol.affine)
-    mask_series = masks + [roi]
-    db.delete(mask_series, not_exists_ok=True)
-    db.write_volume(mask_vol, masks + [roi], ref=ref_series)
 
 def draw_arterial_inputs_notebook(maps, masks):
 
@@ -501,30 +646,30 @@ def draw_arterial_inputs_notebook(maps, masks):
 
 
 def vfa_motion_correction(data, maps):
-    moco_series = maps + ['3D-VFA-MOCO']
-    fit_series = maps + ['3D-VFA-MOCO-FIT']
-    db.delete(moco_series, not_exists_ok=True)
+    moco_series = maps + ['3D-VFA-MOCO'] #build destination series identifier for motion corrected vfa volume
+    fit_series = maps + ['3D-VFA-MOCO-FIT'] #build destination series identifier for model-fitted volume
+    db.delete(moco_series, not_exists_ok=True) #delete duplicates
     db.delete(fit_series, not_exists_ok=True)
 
     # Get data
-    vfa_series = data + ['3D-VFA']
+    vfa_series = data + ['3D-VFA'] #adds 3D-VFA to the series along with the existing data
     vfa_vol = db.volume(vfa_series, 'FlipAngle')
     
     # Perform motion correction
-    coreg, fit, transfo, pars = mdreg.fit(
-        vfa_vol.values, 
+    coreg, fit, transfo, pars = mdreg.fit( #coreg is the motion corrected volume, fit is the fitted volume, transfo is the transformation matrix/holds transformation, pars are the fitted parameters/holds model parameters
+        vfa_vol.values, #supply image intensity array
         fit_image = {
-            'func': mdreg.fit_spgr_vfa_lin,
-            'FA': vfa_vol.coords[0], 
-            'parallel': False,
+            'func': mdreg.fit_spgr_vfa_lin, #provides linear spoiled gradient echo VFA fitting function
+            'FA': vfa_vol.coords[0], #fa values associated with the volume's first coordinate dimension, data is merged in a single 4D array (flip angle, rows, columns, slices) so the first dimension fa
+            'parallel': False, #disable parallel processing, removes image fitting from model
             'progress_bar': True,                          
         }, 
-        fit_coreg = {
+        fit_coreg = { #configure the coregistration method
             'package': 'ants',
             'type_of_transform': 'SyNOnly',
         }, 
-        maxit = 5,       
-        verbose = 2,
+        maxit = 5,  #stop at 5 iterations which should be fine but can be increased if needed, each additional iteration adds ~20 minutes     
+        verbose = 2, #show progress update
     )
 
     # # Compute R1
@@ -532,10 +677,143 @@ def vfa_motion_correction(data, maps):
     # R1 = - np.log(pars[...,1]) / tr_sec
 
     # Save results to DICOM
-    vol_coreg = vreg.volume(coreg, vfa_vol.affine, coords=vfa_vol.coords, dims=vfa_vol.dims)
-    vol_fit = vreg.volume(fit, vfa_vol.affine, coords=vfa_vol.coords, dims=vfa_vol.dims)
-    db.write_volume(vol_coreg, moco_series, ref=vfa_series)
+    vol_coreg = vreg.volume(coreg, vfa_vol.affine, coords=vfa_vol.coords, dims=vfa_vol.dims) #wraps the corrected array with the original volume’s affine, coordinates, and dimensions
+    vol_fit = vreg.volume(fit, vfa_vol.affine, coords=vfa_vol.coords, dims=vfa_vol.dims) #same for fitted array
+    db.write_volume(vol_coreg, moco_series, ref=vfa_series) #write the wrapped volumes to their corresponding output series
     db.write_volume(vol_fit, fit_series, ref=vfa_series)
+
+
+def manually_segment_vfa(maps, masks, build_path, reference_flip_angle=2):
+    """Draw one 3D ROI on a motion-corrected VFA reference angle.
+
+    The resulting mask is stored in the masks DICOM series and as NumPy files.
+    The compressed file also stores the affine so the mask can be checked
+    against other image volumes before reuse.
+    """
+    vfa_series = maps + ['3D-VFA-MOCO'] #adds 3D-VF-MOCO to the maps in a series
+    vfa_volume = db.volume(vfa_series, 'FlipAngle') #load the vfa series as a volume 
+    if 'FlipAngle' not in vfa_volume.dims: #filter image sets by filename denoting vfa images
+        raise ValueError(
+            "The motion-corrected VFA volume has no FlipAngle dimension."
+        )
+
+    flip_angle_dim = vfa_volume.dims.index('FlipAngle') #find index of flip angle in the volume
+    flip_angle_axis = 3 + flip_angle_dim #3 to account for the first 3 dimensions being (row,column,slice) with other indices after that, this finds the flip angle axis after these
+    flip_angles = np.asarray( #convert flip angle to array
+        vfa_volume.coords[flip_angle_dim], dtype=float 
+    ).reshape(-1) #flatten flip angle array to 1D array which here is [2,4,10,20,30]
+    if vfa_volume.values.shape[flip_angle_axis] != flip_angles.size:
+        raise ValueError(
+            "VFA flip-angle coordinates do not match the volume dimension."
+        )
+
+    expected_flip_angles = np.array([2, 4, 10, 20, 30], dtype=float) #important to check, especially for cases like flip angle 4 for patient 1, also just works as a check that naming conventions are consistent
+    missing_flip_angles = [
+        angle
+        for angle in expected_flip_angles
+        if not np.any(np.isclose(flip_angles, angle)) #added this in case of any issues with floats e.g 2.0 or 2.000001 instead of 2
+    ]
+    if missing_flip_angles:
+        raise ValueError(
+            f"Motion-corrected VFA data is missing flip angle(s): "
+            f"{missing_flip_angles}."
+        )
+
+    reference_indices = np.flatnonzero( #return positions of matching file indices
+        np.isclose(flip_angles, reference_flip_angle) #same again it makes sense to put this here
+    )
+    if reference_indices.size != 1: #check for duplicates
+        raise ValueError(
+            f"Expected one reference volume at flip angle "
+            f"{reference_flip_angle:g} degrees, found {reference_indices.size}."
+        )
+
+    reference_image = np.take( #take the reference image from the volume using the index of the reference flip angle along the flip angle axis
+        vfa_volume.values, int(reference_indices[0]), axis=flip_angle_axis #0 to get the first reference flip angle
+    )
+    if reference_image.ndim != 3: #expecting 3 dimensions as the vfa images are all 3D arrays, they will be overlayed on Napari as 5 3D arrays into a 4D but for this check we look for 3D 
+        raise ValueError(
+            f"Expected a 3D VFA reference image, got shape {reference_image.shape}."
+        )
+
+    viewer = napari.Viewer()
+    viewer.add_image(reference_image.T, name=f"VFA {reference_flip_angle:g} degrees") #look for datasets with those names
+    labels_layer = viewer.add_labels(
+        np.zeros(reference_image.T.shape, dtype=np.uint8), #again, transpose because we want slices before rows and columns to work iteratively
+        name="manual VFA segmentation",
+    )
+
+    viewer.show(block=True)
+    vfa_mask = (labels_layer.data > 0).astype(np.uint8).T #same with the mask
+    viewer.close()
+
+    if vfa_mask.shape != reference_image.shape:
+        raise ValueError(
+            f"VFA mask shape {vfa_mask.shape} does not match reference image "# output instead of error useful for debugging
+            f"shape {reference_image.shape}."
+        )
+
+    os.makedirs(build_path, exist_ok=True) #create the destination in the build path
+    mask_path = os.path.join(build_path, "vfa_manual_mask.npy")
+    spatial_mask_path = os.path.join(build_path, "vfa_manual_mask_spatial.npz")
+    np.save(mask_path, vfa_mask)
+    np.savez_compressed(
+        spatial_mask_path,
+        mask=vfa_mask,
+        affine=vfa_volume.affine,
+        reference_flip_angle=reference_flip_angle,
+    )
+
+    mask_series = masks + ['vfa_manual'] #add the manuallky segmented vfa mask to the whole series for analysis
+    db.delete(mask_series, not_exists_ok=True) #delete duplicates, will be useful if the need to make a new folder every run goes away
+    db.write_volume( #write to masks
+        (vfa_mask, vfa_volume.affine),
+        mask_series,
+        ref=vfa_series,
+        verbose=0, #no need to show progress for a quick step
+    )
+    print(f"Painted voxels: {np.count_nonzero(vfa_mask)}")
+    print(f"Saved VFA mask to: {mask_path}")
+    print(f"Saved mask and spatial affine to: {spatial_mask_path}")
+    print(f"Saved DICOM mask series to: {mask_series}")
+
+    edited_slice_indices = np.flatnonzero(np.any(vfa_mask, axis=(0, 1))) #return integer values after flattening
+
+    def show_slice_grid(slice_indices, title):
+        columns = 4 #good viewing size for notebook
+        rows = math.ceil(len(slice_indices) / columns)
+        fig, axes = plt.subplots(
+            rows, columns, figsize=(14, 3.5 * rows), squeeze=False
+        )
+        fig.suptitle(title)
+
+        for slice_index, ax in zip(slice_indices, axes.flat):
+            ax.imshow(reference_image[:, :, slice_index].T, cmap="gray")
+            overlay = np.ma.masked_where(
+                vfa_mask[:, :, slice_index].T == 0, #transpose to put slice first, 
+                vfa_mask[:, :, slice_index].T,
+            )
+            ax.imshow(overlay, cmap="viridis", alpha=0.5, vmin=0, vmax=1, interpolation="nearest", #maybe change from viridis but it works for now, definitely not gray for this. plasma, magma, and inferno are all nice
+            )
+            ax.set_title(f"VFA {reference_flip_angle:g} degree slice {slice_index + 1}") #+1 since it starts at 0 for more understandable viewing for non scientists or those not familiar with python
+            ax.axis("off")
+
+        for ax in axes.flat[len(slice_indices):]:
+            ax.axis("off")
+
+        fig.tight_layout()
+        plt.show()
+
+    show_slice_grid(
+        range(reference_image.shape[2]), #shows the map in a grid on the notebook, the .shape[2] gives a set of 2D images (rows x columns) and iterates through each slice denoted by the 3rd dimension i.e. 2 (rows=0, columns=1, slices=2)
+        "All motion-corrected VFA slices with mask overlay",
+    )
+    if edited_slice_indices.size == 0:
+        print("No VFA slices have been edited.") #just like in axial T2
+    else:
+        show_slice_grid(edited_slice_indices, "Edited VFA slices")
+
+    return vfa_mask
 
 
 def view_vfa_notebook(maps):
@@ -547,43 +825,75 @@ def view_vfa_notebook(maps):
 
 
 def view_adc_notebook(maps):
-    """Display the ADC map in napari; run this from a notebook with %gui qt."""
-    adc_vol = db.volume(maps + ['ADC'])
-    positive_adc = adc_vol.values[np.isfinite(adc_vol.values) & (adc_vol.values > 0)]
+    adc_vol = db.volume(maps + ['ADC']) #load ADC volume and add ADC to maps so the volume is easy to retrieve for analysis
+    positive_adc = adc_vol.values[np.isfinite(adc_vol.values) & (adc_vol.values > 0)] #avoid infinite values and values of 0 and below to not cause errors with log function
     if positive_adc.size == 0:
-        raise ValueError("The ADC map contains no positive finite values to display.")
+        raise ValueError("The ADC map contains no positive finite values to display.") #same again, making sure there are actually values that fit the criteria just laid out
 
-    contrast_max = float(np.percentile(positive_adc, 99))
-    voxel_spacing = np.linalg.norm(adc_vol.affine[:3, :3], axis=0)[::-1]
+    contrast_max = float(np.percentile(positive_adc, 99)) #convert highest 1% of ADC values to floatto set an upper brightness limit for viewing
+    voxel_spacing = np.linalg.norm(adc_vol.affine[:3, :3], axis=0)[::-1] #calculate voxel spacing [::-1] reverses the order to (slice, row, column) to match transposed data 
     viewer = napari.Viewer()
     viewer.add_image(
-        adc_vol.values.T,
-        name='ADC (mm^2/s)',
-        scale=voxel_spacing,
-        contrast_limits=(0, contrast_max),
-        colormap='gray',
+        adc_vol.values.T, #transposing the image array
+        name='ADC (mm^2/s)', #should it be in 10^-6?
+        scale=voxel_spacing, #ensures scaling is cinsistent to voxel size, in case images were acquired in different FOVs or resolutions
+        contrast_limits=(0, contrast_max), #sets limits from 0 to top 1%
+        colormap='gray', #best colour map to use for ADC map
     )
     return viewer
 
 
+def view_vfa_maps(maps):
+    """Display the fitted VFA R1 and S0 maps together in Napari."""
+    r1_vol = db.volume(maps + ['R1_vfa'])
+    s0_vol = db.volume(maps + ['S0_vfa'])
+
+    viewer = napari.Viewer()
+    viewer.add_image(r1_vol.values.T, name='R1_vfa', colormap='viridis')
+    viewer.add_image(s0_vol.values.T, name='S0_vfa', colormap='magma')
+    return viewer
+
+
 def vfa_fit(maps):
-    R1_series = maps + ['R1_vfa']
+    R1_series = maps + ['R1_vfa'] #adding the new maps to exisrting maps (should be empty initially)
     S0_series = maps + ['S0_vfa']
-    db.delete(R1_series, not_exists_ok=True)
+    db.delete(R1_series, not_exists_ok=True) #delete duplicates
     db.delete(S0_series, not_exists_ok=True)
     
     # Get input data
     vfa_series = maps + ['3D-VFA-MOCO']
     vfa_volume = db.volume(vfa_series, 'FlipAngle')
-    tr_sec = db.unique('RepetitionTime', vfa_series)[0]/1000 
-    vfa_array = vfa_volume.values
-    fa_deg = vfa_volume.coords[0]
-    S0_max = 10 * np.amax(vfa_array) / np.sin(np.deg2rad(np.min(fa_deg)))
-    R1_max = 10 # sec
+    tr_sec = db.unique('RepetitionTime', vfa_series)[0]/1000 #get the unique repetition time for each series, change from ms to s
+    vfa_array = vfa_volume.values #signal value array
+    fa_deg = vfa_volume.coords[0] #flip angle should be first
+    S0_max = 10 * np.amax(vfa_array) / np.sin(np.deg2rad(np.min(fa_deg))) #largest signal divided by smallest flip angle in radians
+    R1_max = 10 # corresponds to a min T1 of 0.1 should maybe change this? ask about it
     bounds = ([0,0], [R1_max, S0_max])
     
     # Compute linear and save results
     R1_array, S0_array = dc.vfa_linear(vfa_array, fa_deg, tr_sec, bounds, verbose=0)
+    # Diagnose whether the fitted S0 values are reaching the upper bound
+    s0 = np.asarray(S0_array, dtype=float)
+    valid_s0 = s0[np.isfinite(s0) & (s0 > 0)]
+
+    print(f"Flip angles (degrees): {np.asarray(fa_deg, dtype=float)}")
+    print(f"S0 upper bound: {S0_max:.6g}")
+
+    if valid_s0.size == 0:
+        print("No finite, positive S0 values to summarize.")
+    else:
+        percentiles = np.percentile(valid_s0, [50, 95, 99, 99.9, 100])
+        print(
+            "S0 percentiles (50, 95, 99, 99.9, 100): "
+            f"{percentiles}"
+        )
+
+        near_bound = valid_s0 >= 0.99 * S0_max
+        print(
+            f"Positive finite voxels within 1% of S0 upper bound: "
+            f"{np.count_nonzero(near_bound)} / {valid_s0.size} "
+            f"({100 * np.mean(near_bound):.4f}%)"
+        )
     db.write_volume((R1_array, vfa_volume.affine), R1_series, ref=vfa_series)
     db.write_volume((S0_array, vfa_volume.affine), S0_series, ref=vfa_series)
 
@@ -777,7 +1087,7 @@ def roi_analysis_model_based(maps, masks, imagepath):
             kinetics = 'NXP', 
             TR = pars['RepetitionTime'][0]/1000,
             FA = pars['FlipAngle'][0],
-            r1 = dc.relaxivity(3, 'blood', 'gadobutrol'), 
+            r1 = dc.relaxivity(3, 'blood', 'gadobutrol'), #still use gadobutrol as a contrast agent?
             R10 = np.mean(R10_map[colon_mask > 0]),
             S0 = np.mean(S0_map[colon_mask > 0]),
             R10a = np.mean(R10_map[aif_mask > 0]),
