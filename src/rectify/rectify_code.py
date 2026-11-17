@@ -394,8 +394,7 @@ def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
             new_fa_series.append(new_series)
 
     vfa_series = [resultspath, patient_id, study, f'3D-VFA'] 
-    [db.copy(fa_series, vfa_series) for fa_series in new_fa_series]
-    [db.delete(fa_series) for fa_series in new_fa_series]
+    [db.move(fa_series, vfa_series) for fa_series in new_fa_series]
 
     # Note to read as one array
     # vol = db.volume(vfa_series, 'FlipAngle') # (x, y, z, FA)
