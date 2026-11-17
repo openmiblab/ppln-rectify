@@ -47,7 +47,7 @@ import mdreg #motion correction - particularly useful for non-breathold lung sca
 import vreg #Facilitate alignment and slicing of 3D (and hence 4D with other packages) datasets with different positions and orientations.
 import pydicom
 import pydmr #working with .dmr (dynamic MR) data, a dynamic type of csv flie including ROI curve data, pulse sequence parameters, subject properties, and their standard deviations,  
-from totalsegmentator.map_to_binary import class_map
+#from totalsegmentator.map_to_binary import class_map
 from IPython.display import Image, display
 
 def draw_mask(array: np.ndarray, mask=None, name='ROI', contrast_limits=None) -> np.ndarray: #drawing the mask is kept the same: useful for all types of images
@@ -269,7 +269,51 @@ def manually_segment_ax_dwi(datapath, build_path): #add to this if more dwi plan
     return ax_dwi_labels
 
 
-def harmonize_data(datapath, data):
+def harmonize_dce_data_v2(datapath, resultspath):
+    dce = db.series(datapath, contains='PERFUSION DISCO')[0]
+    patient_id = dce[1]
+
+    dce_series = [resultspath, patient_id, 'Before', '3D-DCE'] #vfa and dce data both used in rectify
+    db.delete(dce_series, not_exists_ok=True)
+
+    if dce:
+        # Merge DCE into one single series
+        db.copy(dce, dce_series)
+        # Store timing info in acquisition time in seconds (miblab default)
+        acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
+        db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
+    else:
+        print(
+            "No series containing 'PERFUSION DISCO' was found. "
+            "DCE harmonization was skipped."
+        )
+
+    print('Finished harmonizing available DCE data.')
+
+
+def harmonize_dce_data(datapath, data):
+    dce = db.series(datapath, contains='PERFUSION DISCO')[0]
+
+    dce_series = data + ['3D-DCE'] #vfa and dce data both used in rectify
+    db.delete(dce_series, not_exists_ok=True)
+
+
+    if dce:
+        # Merge DCE into one single series
+        db.copy(dce, dce_series)
+        # Store timing info in acquisition time in seconds (miblab default)
+        acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
+        db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
+    else:
+        print(
+            "No series containing 'PERFUSION DISCO' was found. "
+            "DCE harmonization was skipped."
+        )
+
+    print('Finished harmonizing available DCE data.')
+
+
+def harmonize_vfa_data(datapath, data):
 
     all_series = db.series(datapath)
     fa_series = {}
@@ -300,7 +344,92 @@ def harmonize_data(datapath, data):
             f"No VFA series found for flip angle(s): {missing_flip_angles}."
         )
 
-    dce = db.series(datapath, contains='PERFUSION DISCO')
+    with open(os.path.join(datapath, 'dbtree.json'), encoding='utf-8') as f:
+        dbtree = json.load(f)
+
+    def source_series_label(series):
+        source_files = db.register.files(dbtree, series)
+        if not source_files:
+            raise ValueError(f"No DICOM files found for series: {series}.")
+        series_description = series[-1][0]
+        source_folder = os.path.relpath(source_files[0], datapath).split(os.sep, 1)[0]
+        return (
+            f"SeriesDescription: {series_description}; "
+            f"source folder: {source_folder}"
+        )
+
+    # If the outputs exists, delete them first
+    vfa_series = data + ['3D-VFA']
+    db.delete(vfa_series, not_exists_ok=True)
+
+    # Merge VFA into 1 series to simplify analysis
+    # Write the correct flip angle in each series
+    for fa, source_series in fa_series.items():
+        staged_series = data + [f'3D-VFA-{fa}']
+        db.delete(staged_series, not_exists_ok=True)
+        print(f"Merging {source_series_label(source_series)}")
+        db.copy(source_series, staged_series)
+        db.edit(staged_series, {'FlipAngle':fa})
+        db.move(staged_series, vfa_series)
+
+    print('Finished harmonizing available data. VFA flip angles are merged into one series.')
+
+
+def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
+
+    expected_fa = [2, 4, 10, 20, 30]
+    missing_fa = []
+    new_fa_series = []
+    
+    for fa in expected_fa:
+        fa_series = db.series(datapath, contains=f'flip {fa}')
+        if fa_series == []:
+            missing_fa.append(fa)
+        else:
+            patient_id = fa_series[1]
+            new_series = [resultspath, patient_id, study, f'3D-VFA ({fa})'] #vfa and dce data both used in rectify
+            db.copy(fa_series, new_series)
+            db.edit(new_series, {'FlipAngle': fa})
+            new_fa_series.append(new_series)
+
+    vfa_series = [resultspath, patient_id, study, f'3D-VFA'] 
+    [db.copy(fa_series, vfa_series) for fa_series in new_fa_series]
+    [db.delete(fa_series) for fa_series in new_fa_series]
+
+    # Note to read as one array
+    # vol = db.volume(vfa_series, 'FlipAngle') # (x, y, z, FA)
+
+    return
+
+
+
+    fa_series = {}
+    missing_flip_angles = []
+    for fa in [2, 4, 10, 20, 30]: #all present rectify flip angles, these shoudln't need changed
+        matches = [
+            series
+            for series in all_vfa_series
+            if re.search(
+                rf'\bflip[\s_]*{fa}(?!\d)',
+                str(series[-1][0]),
+                flags=re.IGNORECASE,
+            )
+            and not str(series[-1][0]).casefold().endswith('_copy')
+        ]
+        if len(matches) == 1:
+            fa_series[fa] = matches[0]
+        elif len(matches) > 1:
+            raise ValueError(
+                f"Found multiple source VFA series for flip angle {fa}: "
+                f"{[series[-1][0] for series in matches]}."
+            )
+        else:
+            missing_flip_angles.append(fa)
+
+    if missing_flip_angles: # applies if even one perfusion flip angle is missing, useful check with fa 4 having a slightly different file name than the others (missing an underscore before the number)
+        raise ValueError(
+            f"No VFA series found for flip angle(s): {missing_flip_angles}."
+        )
 
     with open(os.path.join(datapath, 'dbtree.json'), encoding='utf-8') as f:
         dbtree = json.load(f)
@@ -318,9 +447,7 @@ def harmonize_data(datapath, data):
 
     # If the outputs exists, delete them first
     vfa_series = data + ['3D-VFA']
-    dce_series = data + ['3D-DCE'] #vfa and dce data both used in rectify
     db.delete(vfa_series, not_exists_ok=True)
-    db.delete(dce_series, not_exists_ok=True)
 
     # Merge VFA into 1 series to simplify analysis
     # Write the correct flip angle in each series
@@ -332,19 +459,14 @@ def harmonize_data(datapath, data):
         db.edit(staged_series, {'FlipAngle':fa})
         db.move(staged_series, vfa_series)
 
-    if dce:
-        # Merge DCE into one single series
-        for phase in dce:
-            print(f"Merging {source_series_label(phase)}")
-            db.copy(phase, dce_series)
-        # Store timing info in acquisition time in seconds (miblab default)
-        acq_time = db.values(dce_series, 'TriggerTime', dims=['SliceLocation', 'TriggerTime'])
-        db.edit(dce_series, {'AcquisitionTime': acq_time/1000}, dims=['SliceLocation', 'TriggerTime'])
-    else:
-        print(
-            "No series containing 'PERFUSION DISCO' was found. "
-            "DCE harmonization was skipped."
-        )
+    print('Finished harmonizing available data. VFA flip angles are merged into one series.')
+
+
+
+def harmonize_data(datapath, data):
+
+    harmonize_dce_data(datapath, data)
+    harmonize_vfa_data(datapath, data)
 
     print('Finished harmonizing available data. VFA flip angles are merged into one series.')
 
@@ -1302,8 +1424,10 @@ if __name__=='__main__':
 
     # --- USER SETTINGS ---
     #
-    DATAPATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\scans" #change RECTIFY01 to RECTIFY_XY for each patient
-    BUILD_PATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\Rectify" #need to change this to a new folder for each run
+    DATAPATH = r"C:\Users\md1spsx\Documents\Data\rectify\source"
+    BUILD_PATH = r"C:\Users\md1spsx\Documents\Data\rectify\results"
+    #DATAPATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\scans" #change RECTIFY01 to RECTIFY_XY for each patient
+    #BUILD_PATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\Rectify" #need to change this to a new folder for each run
     # 
     # --- END USER SETTINGS ---
 
@@ -1318,23 +1442,27 @@ if __name__=='__main__':
     DATA = [resultspath, SUBJ, 'Data']
     MAPS = [resultspath, SUBJ, 'Maps']
     MASKS = [resultspath, SUBJ, 'Masks']
-    TOTAL_MR = class_map['total_mr']
+    #TOTAL_MR = class_map['total_mr']
 
-    harmonize_data(DATAPATH, DATA)
-    compute_descriptive_maps(DATA, MAPS)
-    adc_map(DATAPATH, MAPS)
-    autosegment_colorectal(MAPS, MASKS)
-    edit_autosegmented_colorectal(MAPS, MASKS)
-    draw_arterial_inputs(MAPS, MASKS)
-    vfa_motion_correction(DATA, MAPS)
-    vfa_fit(MAPS)
-    dce_motion_correction(DATA, MAPS)
-    align_vfa_with_dce(MAPS, MASKS)
-    roi_analysis_model_based(MAPS, MASKS, IMAGEPATH)
-    roi_analysis_model_free(MAPS, MASKS, IMAGEPATH)
-    pixel_analysis_model_free(MAPS, MASKS, IMAGEPATH)
-    pixel_analysis_model_based(MAPS, MASKS, IMAGEPATH, CHECKPOINTPATH)
-    pixel_averages_model_based(MAPS, MASKS, SUBJ, BUILD_PATH)
+    #harmonize_dce_data(DATAPATH, DATA)
+    harmonize_vfa_data_v2(DATAPATH, DATA)
+    #harmonize_dce_data_v2(DATAPATH, resultspath)
+
+    # harmonize_data(DATAPATH, DATA)
+    # compute_descriptive_maps(DATA, MAPS)
+    # adc_map(DATAPATH, MAPS)
+    # autosegment_colorectal(MAPS, MASKS)
+    # edit_autosegmented_colorectal(MAPS, MASKS)
+    # draw_arterial_inputs(MAPS, MASKS)
+    # vfa_motion_correction(DATA, MAPS)
+    # vfa_fit(MAPS)
+    # dce_motion_correction(DATA, MAPS)
+    # align_vfa_with_dce(MAPS, MASKS)
+    # roi_analysis_model_based(MAPS, MASKS, IMAGEPATH)
+    # roi_analysis_model_free(MAPS, MASKS, IMAGEPATH)
+    # pixel_analysis_model_free(MAPS, MASKS, IMAGEPATH)
+    # pixel_analysis_model_based(MAPS, MASKS, IMAGEPATH, CHECKPOINTPATH)
+    # pixel_averages_model_based(MAPS, MASKS, SUBJ, BUILD_PATH)
 
     # view_maps(DATA)
     
