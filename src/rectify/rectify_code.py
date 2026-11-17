@@ -379,7 +379,7 @@ def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
 
     expected_fa = [2, 4, 10, 20, 30]
     missing_fa = []
-    new_fa_series = []
+    vfa_series = [resultspath, patient_id, study, f'3D-VFA'] 
     
     for fa in expected_fa:
         fa_series = db.series(datapath, contains=f'flip {fa}')
@@ -391,10 +391,7 @@ def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
             new_series = [resultspath, patient_id, study, f'3D-VFA ({fa})'] #vfa and dce data both used in rectify
             db.copy(fa_series, new_series)
             db.edit(new_series, {'FlipAngle': fa})
-            new_fa_series.append(new_series)
-
-    vfa_series = [resultspath, patient_id, study, f'3D-VFA'] 
-    [db.move(fa_series, vfa_series) for fa_series in new_fa_series]
+            db.move(new_series, vfa_series)
 
     # Note to read as one array
     # vol = db.volume(vfa_series, 'FlipAngle') # (x, y, z, FA)
