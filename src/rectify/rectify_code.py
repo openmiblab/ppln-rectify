@@ -39,6 +39,28 @@ import pydmr #working with .dmr (dynamic MR) data, a dynamic type of csv flie in
 #from totalsegmentator.map_to_binary import class_map
 from IPython.display import Image, display
 
+#
+def setup_path(datapath, build_path, subj):
+    imagepath = os.path.join(build_path, "images")
+    checkpointspath = os.path.join(build_path, "checkpoints")
+    os.makedirs(imagepath, exist_ok=True)
+    os.makedirs(checkpointspath, exist_ok=True)
+
+    resultspath = os.path.join(build_path, "dicom")
+    data = [resultspath, subj, "Data"]
+    maps = [resultspath, subj, "Maps"]
+    masks = [resultspath, subj, "Masks"]
+
+    return {
+        "datapath": datapath,
+        "imagepath": imagepath,
+        "checkpointspath": checkpointspath,
+        "resultspath": resultspath,
+        "data": data,
+        "maps": maps,
+        "masks": masks,
+    }
+
 def draw_mask(array: np.ndarray, mask=None, name='ROI', contrast_limits=None) -> np.ndarray: #drawing the mask is kept the same: useful for all types of images
     # Ensure it's a numpy array
     array = np.asarray(array).T
@@ -695,6 +717,47 @@ def adc_map(datapath, maps):
     db.write_volume((adc, affine), adc_series, verbose=0)
     print("Finished creating ADC map in native axial DWI space (units: mm^2/s).")
 
+    positive_adc = adc[np.isfinite(adc) & (adc > 0)]
+    if positive_adc.size == 0:
+        raise ValueError("The ADC map contains no positive finite values to display.")
+
+    n_slices = adc.shape[2]
+    n_columns = 4
+    n_rows = (n_slices + n_columns - 1) // n_columns
+
+    def show_slice_grid(vmax, scale_label):
+        fig, axes = plt.subplots(
+            n_rows, n_columns,
+            figsize=(4 * n_columns, 3.5 * n_rows),
+            squeeze=False,
+        )
+        fig.suptitle(f"Axial ADC slices ({scale_label})")
+
+        for i in range(n_slices):
+            ax = axes.flat[i]
+            image = ax.imshow(
+                adc[:, :, i].T,
+                cmap='gray',
+                origin='lower',
+                vmin=0,
+                vmax=vmax,
+            )
+            ax.set_title(f"ADC - slice {i + 1}")
+            ax.axis('off')
+            fig.colorbar(image, ax=ax)
+
+        for ax in axes.flat[n_slices:]:
+            ax.axis('off')
+
+        fig.tight_layout()
+        plt.show()
+
+    show_slice_grid(float(np.max(positive_adc)), "full intensity range")
+    show_slice_grid(
+        float(np.percentile(positive_adc, 99)),
+        "99th percentile scale",
+    )
+
 
 def draw_arterial_inputs_notebook(maps, masks):
 
@@ -817,6 +880,9 @@ def manually_segment_vfa(maps, masks, build_path, reference_flip_angle=2):
         np.zeros(reference_image.T.shape, dtype=np.uint8), #again, transpose because we want slices before rows and columns to work iteratively
         name="manual VFA segmentation",
     )
+    labels_layer.selected_label = 1
+    viewer.layers.selection.active = labels_layer
+    labels_layer.mode = "paint"
 
     viewer.show(block=True)
     vfa_mask = (labels_layer.data > 0).astype(np.uint8).T #same with the mask
@@ -826,6 +892,16 @@ def manually_segment_vfa(maps, masks, build_path, reference_flip_angle=2):
         raise ValueError(
             f"VFA mask shape {vfa_mask.shape} does not match reference image "# output instead of error useful for debugging
             f"shape {reference_image.shape}."
+        )
+
+    painted_voxels = int(np.count_nonzero(vfa_mask))
+    if painted_voxels == 0:
+        raise ValueError(
+            "The VFA mask is empty. Paint at least one voxel before closing Napari."
+        )
+    if painted_voxels == vfa_mask.size:
+        raise ValueError(
+            "The VFA mask covers the entire volume. Leave background voxels unpainted."
         )
 
     os.makedirs(build_path, exist_ok=True) #create the destination in the build path
@@ -842,12 +918,12 @@ def manually_segment_vfa(maps, masks, build_path, reference_flip_angle=2):
     mask_series = masks + ['vfa_manual'] #add the manuallky segmented vfa mask to the whole series for analysis
     db.delete(mask_series, not_exists_ok=True) #delete duplicates, will be useful if the need to make a new folder every run goes away
     db.write_volume( #write to masks
-        (vfa_mask, vfa_volume.affine),
+        (vfa_mask.astype(np.uint16), vfa_volume.affine),
         mask_series,
         ref=vfa_series,
         verbose=0, #no need to show progress for a quick step
     )
-    print(f"Painted voxels: {np.count_nonzero(vfa_mask)}")
+    print(f"Painted voxels: {painted_voxels}")
     print(f"Saved VFA mask to: {mask_path}")
     print(f"Saved mask and spatial affine to: {spatial_mask_path}")
     print(f"Saved DICOM mask series to: {mask_series}")
