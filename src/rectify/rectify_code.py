@@ -1,40 +1,29 @@
 """
 RECTIFY study processing pipeline.
-Adjusted from lung_dce.py
-
-What does it do?
 
 This module processes a colorectal DISCO/DCE-MRI dataset through the following steps:
 1. Harmonizes DICOM data structure by merging VFA and DCE series.
 2. Computes descriptive DCE maps (e.g., baseline, max enhancement).
-3. Automatically segments colorectal organs using TotalSegmentator (or maybe not, totalsegmentator doesn't have a rectal index).
-4. Allows manual editing of colon segmentations via napari.  
-5. Draws arterial input function (AIF) region on maximum enhancement image.
-6. Performs motion correction on VFA and DCE series using mdreg.
+3. Allows manual editing of colorectal segmentations via napari.  
+4. Draws arterial input function (AIF) region on maximum enhancement image.
+5. Performs motion correction on VFA and DCE series using mdreg.
+6. Computes ADC maps using DICOM stored b-values in DWI images
 7. Fits VFA data to compute R1 and S0 maps.
 8. Aligns VFA-derived maps with DCE data space.
 9. Conducts ROI-based analysis using both model-free and model-based approaches.
 10. Performs pixel-wise pharmacokinetic modeling using model-free and model-based methods.
 
-How to use?
-
+How to use:
 1. Define a virtual envronment and install the requirements.
 2. Set the DATAPATH variable to point to the folder containing the DICOM data.
 3. Run the script. It will create a build folder in the current working directory.
 4. All intermediate results and final outputs will be saved in the build folder
-
-All steps will be executed sequentially when running the script
-Steps 1-3 are automated, while steps 4-5 require user interaction. 
-The script will pause and open a napari viewer for manual editing 
-of segmentations and drawing of AIF. After editing, close the napari 
-window to resume execution. All subsequent steps are automated again.
 """
 
 import os
 import json
 import re
 from collections import defaultdict
-
 import numpy as np
 import dcmri as dc #for dce images
 import napari #useful software for viewing and manually editing images (2D, 3D, and 4D)
@@ -497,39 +486,6 @@ def compute_descriptive_maps(data, maps):
 
 
 def autosegment_colorectal(maps, masks): #comment out the colorectal section: go to section 3 for colorectal orgns
-
-    # --- 1. Draw colorectal on baseline image
-    #ref_series = maps + ['Sb']
-    #ref_vol = db.volume(ref_series) 
-
-    # Create label and save
-    #label_vol = miblab.totseg(ref_vol, cutoff=0.01, task='total_mr', device='cpu')
-    #total_mr_series = masks + ['total_mr']
-    #db.delete(total_mr_series, not_exists_ok=True) 
-    #db.write_volume(label_vol, total_mr_series, ref=ref_series)
-
-    # Create individual masks for key structures
-    #total_mr = class_map['total_mr']
-    #for label_value in [10,11]:
-    #    mask_arr = np.where(label_vol.values==label_value, 1, 0).astype(np.int16)
-    #    mask_series = masks + [total_mr[label_value]]
-    #    db.delete(mask_series, not_exists_ok=True) 
-    #    db.write_volume((mask_arr, label_vol.affine), mask_series, ref=ref_series)
-
-    #print('Finished automatic segmentation of colorectal. Masks are saved in the MASKS series.')
-
-    # # --- 2. Draw liver/kidneys/vessels on maximum enhancement image
-    # ref_series = MAPS + ['SEmax']
-    # ref_vol = db.volume(ref_series) 
-
-    # # Create label and save
-    # label_vol = miblab.totseg(ref_vol, cutoff=0.01, task='total_mr', device='cpu')
-    # db.write_volume(label_vol, MASKS + ['total_mr_SEmax'], ref=ref_series)
-
-    # # Create individual masks for key structures
-    # for label_value in [2,3,5,22,23,24,25]:
-    #     mask_arr = np.where(label_vol.values==label_value, 1, 0).astype(np.int16)
-    #     db.write_volume((mask_arr, label_vol.affine), MASKS + [TOTAL_MR[label_value]], ref=ref_series)
 
 # --- 3. Draw colorectal organs on baseline image
     ref_series = maps + ['Sb']
@@ -1420,11 +1376,8 @@ def pixel_averages_model_based(maps, masks, subj, build_path):
 if __name__=='__main__':
 
     # --- USER SETTINGS ---
-    #
-    DATAPATH = r"C:\Users\md1spsx\Documents\Data\rectify\source"
-    BUILD_PATH = r"C:\Users\md1spsx\Documents\Data\rectify\results"
-    #DATAPATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\scans" #change RECTIFY01 to RECTIFY_XY for each patient
-    #BUILD_PATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\RECTIFY_01\Rectify" #need to change this to a new folder for each run
+    DATAPATH = r"C:\Users\cmq26nc\neoadj\venvs\ppln-rectify\scans\Patient_02" #change to RECTIFY_XY for each patient
+    BUILD_PATH = r"C:\Users\cmq26nc\neoadj\venvs\rectify\results_02\Patient_02_06" #need to change this to a new folder for each run
     # 
     # --- END USER SETTINGS ---
 
@@ -1460,6 +1413,5 @@ if __name__=='__main__':
     # pixel_analysis_model_free(MAPS, MASKS, IMAGEPATH)
     # pixel_analysis_model_based(MAPS, MASKS, IMAGEPATH, CHECKPOINTPATH)
     # pixel_averages_model_based(MAPS, MASKS, SUBJ, BUILD_PATH)
-
     # view_maps(DATA)
     
