@@ -2,7 +2,7 @@
 RECTIFY study processing pipeline.
 
 This module processes a colorectal DISCO/DCE-MRI dataset through the following steps:
-1. Harmonizes DICOM data structure by merging VFA and DCE series.
+1. Harmonises DICOM data structure by merging VFA and DCE series.
 2. Computes descriptive DCE maps (e.g., baseline, max enhancement).
 3. Allows manual editing of colorectal segmentations via napari.  
 4. Draws arterial input function (AIF) region on maximum enhancement image.
@@ -296,10 +296,10 @@ def harmonize_dce_data_v2(datapath, resultspath):
     else:
         print(
             "No series containing 'PERFUSION DISCO' was found. "
-            "DCE harmonization was skipped."
+            "DCE harmonisation was skipped."
         )
 
-    print('Finished harmonizing available DCE data.')
+    print('Finished harmonising available DCE data.')
 
 
 def harmonize_dce_data(datapath, data):
@@ -467,7 +467,7 @@ def harmonize_vfa_data_v2(datapath, resultspath, study='Before'):
         db.edit(staged_series, {'FlipAngle':fa})
         db.move(staged_series, vfa_series)
 
-    print('Finished harmonizing available data. VFA flip angles are merged into one series.')
+    print('Finished harmonising available data. VFA flip angles are merged into one series.')
 
 
 
@@ -476,7 +476,7 @@ def harmonize_data(datapath, data):
     harmonize_dce_data(datapath, data)
     harmonize_vfa_data(datapath, data)
 
-    print('Finished harmonizing available data. VFA flip angles are merged into one series.')
+    print('Finished harmonising available data. VFA flip angles are merged into one series and DCE data is harmonised.')
 
 
 def view_dce_notebook(data):
@@ -666,7 +666,7 @@ def adc_map(datapath, maps):
         or any(len(images_by_slice[location][0.0]) != 1 for location in slice_locations)
     ):
         raise ValueError(
-            "Some DWI images lack DiffusionBValue; they can only be treated as "
+            "Some DWI images lack Diffusion b-Value; they can only be treated as "
             "b=0 when there is exactly one such image per slice and no explicit b=0 images."
         )
 
@@ -982,6 +982,7 @@ def view_adc_notebook(maps):
         raise ValueError("The ADC map contains no positive finite values to display.") #same again, making sure there are actually values that fit the criteria just laid out
 
     contrast_max = float(np.percentile(positive_adc, 99)) #convert highest 1% of ADC values to floatto set an upper brightness limit for viewing
+    contrast_min = float(np.percentile(positive_adc, 1))
     voxel_spacing = np.linalg.norm(adc_vol.affine[:3, :3], axis=0)[::-1] #calculate voxel spacing [::-1] reverses the order to (slice, row, column) to match transposed data 
     viewer = napari.Viewer()
     viewer.add_image(
@@ -991,6 +992,40 @@ def view_adc_notebook(maps):
         contrast_limits=(0, contrast_max), #sets limits from 0 to top 1%
         colormap='gray', #best colour map to use for ADC map
     )
+
+    n_slices = adc_vol.values.shape[2]
+    n_columns = 4
+    n_rows = (n_slices + n_columns - 1) // n_columns
+    fig, axes = plt.subplots(
+        n_rows, n_columns,
+        figsize=(4 * n_columns, 3.5 * n_rows),
+        squeeze=False,
+    )
+    fig.suptitle("Axial ADC slices (1st-99th percentile)")
+
+    for slice_index in range(n_slices):
+        ax = axes.flat[slice_index]
+        slice_data = adc_vol.values[:, :, slice_index].T
+        display_data = np.ma.masked_where(
+            ~np.isfinite(slice_data) | (slice_data < contrast_min),
+            slice_data,
+        )
+        image = ax.imshow(
+            display_data,
+            cmap='gray',
+            origin='lower',
+            vmin=contrast_min,
+            vmax=contrast_max,
+        )
+        ax.set_title(f"ADC - slice {slice_index + 1}")
+        ax.axis('off')
+        fig.colorbar(image, ax=ax)
+
+    for ax in axes.flat[n_slices:]:
+        ax.axis('off')
+
+    fig.tight_layout()
+    plt.show()
     return viewer
 
 
@@ -1003,6 +1038,354 @@ def view_vfa_maps(maps):
     viewer.add_image(r1_vol.values.T, name='R1_vfa', colormap='viridis')
     viewer.add_image(s0_vol.values.T, name='S0_vfa', colormap='magma')
     return viewer
+
+
+def _positive_percentile_vmax(array, percentile=99):
+    positive_values = array[np.isfinite(array) & (array > 0)]
+    if positive_values.size == 0:
+        raise ValueError("Map contains no finite positive values to display.")
+    return float(np.percentile(positive_values, percentile))
+
+
+def print_r1s0_maps(r1_vol, s0_vol, imagepath):
+    """Plot fitted R1 and S0 slices with 99th-percentile display limits."""
+    r1 = np.asarray(r1_vol.values)
+    s0 = np.asarray(s0_vol.values)
+    if r1.ndim != 3 or s0.ndim != 3 or r1.shape != s0.shape:
+        raise ValueError("R1 and S0 volumes must have matching 3D shapes.")
+
+    n_slices = r1.shape[2]
+    if n_slices == 0:
+        raise ValueError("R1 and S0 volumes contain no slices to display.")
+    n_rows = (n_slices + 1) // 2
+
+    r1_min, r1_max = 0, _positive_percentile_vmax(r1)
+    s0_min, s0_max = 0, _positive_percentile_vmax(s0)
+
+    fig, axes = plt.subplots(
+        n_rows, 4,
+        figsize=(16, 4 * n_rows),
+        squeeze=False,
+    )
+
+    for slice_index in range(n_slices):
+        row = slice_index // 2
+        first_col = (slice_index % 2) * 2
+
+        r1_image = axes[row, first_col].imshow(
+            r1[:, :, slice_index].T, cmap='magma', origin='upper',
+            vmin=r1_min, vmax=r1_max,
+        )
+        axes[row, first_col].set_title(
+            f'R1 - slice {slice_index + 1} (99th percentile scale)'
+        )
+        axes[row, first_col].axis('off')
+        fig.colorbar(r1_image, ax=axes[row, first_col])
+
+        s0_image = axes[row, first_col + 1].imshow(
+            s0[:, :, slice_index].T, cmap='magma', origin='upper',
+            vmin=s0_min, vmax=s0_max,
+        )
+        axes[row, first_col + 1].set_title(
+            f'S0 - slice {slice_index + 1} (99th percentile scale)'
+        )
+        axes[row, first_col + 1].axis('off')
+        fig.colorbar(s0_image, ax=axes[row, first_col + 1])
+
+    if n_slices % 2:
+        for col in range(2, 4):
+            axes[-1, col].axis('off')
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(imagepath, 'R1_S0_slices_scaled.png'))
+    plt.show()
+
+
+def s0guide(s0_vol): 'print labelled grid in notebook to decide on thresholding'
+    s0 = np.asarray(s0_vol.values)
+    if s0.ndim != 3:
+        raise ValueError("S0 volume must be three-dimensional.")
+
+    s0_min, s0_max = 0, _positive_percentile_vmax(s0)
+
+    slice_number = 20  #show every n slices
+    slice_index = slice_number - 1  # python indices start at 0
+
+    if slice_index >= s0.shape[2]:
+        raise IndexError(f"S0 has only {s0.shape[2]} slices.")
+
+    grid_step = 30  # Label and draw grid lines every 10 voxels
+    row_count, column_count = s0.shape[:2]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    image = ax.imshow(
+        s0[:, :, slice_index].T,
+        cmap="viridis",
+        origin="upper",
+        vmin=s0_min,
+        vmax=s0_max,
+        interpolation="nearest",
+    )
+
+    fig.colorbar(image, ax=ax, label="S0")
+    ax.set_xticks(np.arange(0, row_count, grid_step))
+    ax.set_yticks(np.arange(0, column_count, grid_step))
+    ax.grid(which="major", color="white", linewidth=0.5, alpha=0.6)
+    fig.set_figheight(10)
+    fig.set_figwidth(10)
+
+    ax.set_xlabel("Row index (axis 0)")
+    ax.set_ylabel("Column index (axis 1)")
+    ax.set_title(f"S0 — slice {slice_number}")
+    plt.tight_layout()
+    plt.show()
+
+
+def _build_s0_3d_masks(s0): #define the threshold and roi boundaries
+    if s0.ndim != 3:
+        raise ValueError("S0 volume must be three-dimensional.")
+
+    s0_tumour_low_threshold = 3000
+    s0_tumour_high_threshold = 7000
+    finite = np.isfinite(s0)
+
+    tumour_roi = np.zeros(s0.shape, dtype=bool)
+    tumour_roi[150:250, 200:300, 17:35] = True #change these (row column slice)
+    s0_tumour_mask = tumour_roi & finite & (
+        (s0 <= s0_tumour_low_threshold) | (s0 >= s0_tumour_high_threshold) #finite and get rid of moderate values
+    )
+
+    ht_roi = np.zeros(s0.shape, dtype=bool)
+    ht_roi[100:400, 50:450, 1:50] = True
+    s0_ht_mask = ht_roi & finite & (
+        (s0 > s0_tumour_low_threshold) & (s0 < s0_tumour_high_threshold)
+    )
+
+    return s0_tumour_mask, s0_ht_mask
+
+
+def s0_3d_mask(r1_vol, s0_vol, IMAGEPATH):
+    
+
+    s0 = np.asarray(s0_vol.values)
+    s0_tumour_mask, s0_ht_mask = _build_s0_3d_masks(s0)
+
+    s0tumourfeats = npr.firstorder(s0,s0_tumour_mask,voxelVolume=1,binWidth=5,voxelArrayShift=0,extend=True)
+
+    units = firstorder_units(intensity_unit='Arbitrary Units',voxel_unit='voxels')
+    print(f"Mean S0 in Tumour = {s0tumourfeats['Mean']:.4f}", units['Mean'])
+    print(f"Median S0 in Tumour = {s0tumourfeats['Median']:.4f}", units['Median']) 
+    print(f"Standard Deviation of S0 in Tumour = {s0tumourfeats['StandardDeviation']:.4f}", units['StandardDeviation']) 
+    print(f"Tumour Heterogeneity: {s0tumourfeats['Heterogeneity']:.4f}", units['Heterogeneity']) 
+    print(f"Top 5% Tumour S0: {s0tumourfeats['95Percentile']:.4f}", units['95Percentile'])
+    print(f"Top 10% Tumour S0: {s0tumourfeats['90Percentile']:.4f}", units['90Percentile'])
+    print(f"Bottom 10% Tumour S0: {s0tumourfeats['10Percentile']:.4f}", units['10Percentile'])
+    print(f"Bottom 5% Tumour S0: {s0tumourfeats['05Percentile']:.4f}", units['05Percentile'])
+
+    s0htfeats = npr.firstorder(s0,s0_ht_mask,voxelVolume=1,binWidth=5,voxelArrayShift=0,extend=True)
+    print('') #space
+    print(f"Mean S0 in Healthy Tissue = {s0htfeats['Mean']:.4f}", units['Mean'])
+    print(f"Median S0 in Healthy Tissue = {s0htfeats['Median']:.4f}", units['Median']) 
+    print(f"Standard Deviation of S0 in Healthy Tissue = {s0htfeats['StandardDeviation']:.4f}", units['StandardDeviation']) 
+    print(f"Top 5% Healthy Tissue S0 = {s0htfeats['95Percentile']:.4f}", units['95Percentile'])
+    print(f"Top 10% Healthy Tissue S0 = {s0htfeats['90Percentile']:.4f}", units['90Percentile'])
+    print(f"Bottom 10% Healthy Tissue S0 = {s0htfeats['10Percentile']:.4f}", units['10Percentile'])
+    print(f"Bottom 5% Healthy Tissue S0 = {s0htfeats['05Percentile']:.4f}", units['05Percentile'])
+
+
+def r1_3d_stats(r1_vol, s0_vol): #get r1 features in the same masks as tumnour and healthy tissue as s0
+
+    r1 = np.asarray(r1_vol.values)
+    s0 = np.asarray(s0_vol.values)
+    if s0.shape != r1.shape:
+        raise ValueError(f"S0 shape {s0.shape} does not match R1 shape {r1.shape}.")
+
+    s0_tumour_mask, s0_ht_mask = _build_s0_3d_masks(s0)
+    for name, mask in (
+        ("tumour", s0_tumour_mask),
+        ("healthy tissue", s0_ht_mask),
+    ):
+        if not np.any(mask):
+            raise ValueError(f"The {name} mask contains no voxels.")
+        if not np.all(np.isfinite(r1[mask])):
+            raise ValueError(f"R1 contains non-finite values inside the {name} mask.")
+
+    r1tumourfeats = npr.firstorder(
+        r1, s0_tumour_mask,
+        voxelVolume=1, binWidth=5, voxelArrayShift=0, extend=True,
+    )
+    r1htfeats = npr.firstorder(
+        r1, s0_ht_mask,
+        voxelVolume=1, binWidth=5, voxelArrayShift=0, extend=True,
+    )
+
+    feature_labels = {
+        "Mean": "Mean",
+        "Median": "Median",
+        "StandardDeviation": "Standard Deviation",
+        "Heterogeneity": "Heterogeneity",
+        "95Percentile": "Top 5%",
+        "90Percentile": "Top 10%",
+        "10Percentile": "Bottom 10%",
+        "05Percentile": "Bottom 5%",
+    }
+    r1units = firstorder_units(intensity_unit="/s", voxel_unit="voxels")
+    for region, features in (
+        ("Tumour", r1tumourfeats),
+        ("Healthy Tissue", r1htfeats),
+    ):
+        for key, label in feature_labels.items():
+            print(f"{label} R1 in {region} = {features[key]:.4f}", r1units[key])
+
+
+def r1s0_hist(r1_vol, s0_vol, imagepath): #plot, print and save histograms
+    r1 = np.asarray(r1_vol.values)
+    s0 = np.asarray(s0_vol.values)
+    if r1.shape != s0.shape:
+        raise ValueError(f"S0 shape {s0.shape} does not match R1 shape {r1.shape}.")
+
+    s0_tumour_mask, s0_ht_mask = _build_s0_3d_masks(s0)
+    histogram_values = [
+        s0[s0_tumour_mask & np.isfinite(s0)],
+        s0[s0_ht_mask & np.isfinite(s0)],
+        r1[s0_tumour_mask & np.isfinite(r1)],
+        r1[s0_ht_mask & np.isfinite(r1)],
+    ]
+    histogram_names = [
+        "S0 Tumour",
+        "S0 Healthy Tissue",
+        "R1 Tumour",
+        "R1 Healthy Tissue",
+    ]
+    histogram_colors = ["gold", "gold", "purple", "purple"]
+    histogram_units = [
+        "S0 (Arbitrary Units)",
+        "S0 (Arbitrary Units)",
+        "R1 (/s)",
+        "R1 (/s)",
+    ]
+    histogram_maxima = [18000, 18000, 10, 10]
+    number_of_bins = 300
+
+    for name, values in zip(histogram_names, histogram_values):
+        if values.size == 0:
+            raise ValueError(f"No finite voxel values found for {name}.")
+
+    def make_histogram_bins(values, max_value):
+        if max_value is None:
+            return np.histogram_bin_edges(values, bins=number_of_bins)
+
+        lower_limit = min(0.0, float(np.min(values)))
+        if max_value <= lower_limit:
+            raise ValueError(
+                f"Histogram maximum ({max_value}) must be greater than "
+                f"the minimum data value ({lower_limit})."
+            )
+        return np.linspace(lower_limit, max_value, number_of_bins + 1)
+
+    histogram_bins = [
+        make_histogram_bins(values, max_value)
+        for values, max_value in zip(histogram_values, histogram_maxima)
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, name, values, color, units, bins, max_value in zip(
+        axes.flat,
+        histogram_names,
+        histogram_values,
+        histogram_colors,
+        histogram_units,
+        histogram_bins,
+        histogram_maxima,
+    ):
+        ax.hist(values, bins=bins, color=color, alpha=0.75)
+        ax.set_title(name)
+        ax.set_xlabel(units)
+        ax.set_ylabel("Voxels")
+
+        stats_text = (
+            f"Mean = {np.mean(values):.2f}\n"
+            f"Median = {np.median(values):.2f}\n"
+            f"1σ = {np.std(values):.2f}\n"
+            f"Bottom 5% = {np.percentile(values, 5):.2f}\n"
+            f"Bottom 10% = {np.percentile(values, 10):.2f}\n"
+            f"Top 10% = {np.percentile(values, 90):.2f}\n"
+            f"Top 5% = {np.percentile(values, 95):.2f}\n"
+            f"Volume = {values.size:,} Voxels"
+        )
+        ax.text(
+            0.98, 0.97, stats_text,
+            transform=ax.transAxes,
+            ha="right", va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.85, "boxstyle": "round"},
+        )
+        if max_value is not None:
+            ax.set_xlim(right=max_value)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(imagepath, "rectify_histograms.png"))
+    plt.show()
+
+
+def show_s0_3d_mask(s0_vol, imagepath): #show the masks on regular vfa images (mainly used for debugging and improving the mask, still honing the exact numbers)
+    from matplotlib.colors import ListedColormap
+
+    s0 = np.asarray(s0_vol.values)
+    s0_tumour_mask, s0_ht_mask = _build_s0_3d_masks(s0)
+    finite_values = s0[np.isfinite(s0)]
+    if finite_values.size == 0:
+        raise ValueError("S0 volume contains no finite values to display.")
+
+    slices_to_show = list(range(17, min(35, s0.shape[2]), 3))
+    if not slices_to_show:
+        raise ValueError("S0 volume has no slices in the configured tumour range.")
+
+    vmax = float(np.percentile(finite_values, 99))
+    if vmax <= 0:
+        raise ValueError("S0 volume has no positive display range.")
+
+    fig, axes = plt.subplots(
+        len(slices_to_show), 2,
+        figsize=(10, 3.5 * len(slices_to_show)),
+        squeeze=False,
+    )
+
+    for row, slice_index in enumerate(slices_to_show):
+        s0_slice = s0[:, :, slice_index].T
+
+        axes[row, 0].imshow(
+            s0_slice, cmap="gray", origin="upper", vmin=0, vmax=vmax
+        )
+        tumour_overlay = np.ma.masked_where(
+            ~s0_tumour_mask[:, :, slice_index].T,
+            s0_tumour_mask[:, :, slice_index].T,
+        )
+        axes[row, 0].imshow(
+            tumour_overlay, cmap=ListedColormap(["red"]),
+            alpha=0.45, origin="upper", vmin=0, vmax=1,
+        )
+        axes[row, 0].set_title(f"Tumour mask — slice {slice_index}")
+        axes[row, 0].axis("off")
+
+        axes[row, 1].imshow(
+            s0_slice, cmap="gray", origin="upper", vmin=0, vmax=vmax
+        )
+        ht_overlay = np.ma.masked_where(
+            ~s0_ht_mask[:, :, slice_index].T,
+            s0_ht_mask[:, :, slice_index].T,
+        )
+        axes[row, 1].imshow(
+            ht_overlay, cmap=ListedColormap(["cyan"]),
+            alpha=0.45, origin="upper", vmin=0, vmax=1,
+        )
+        axes[row, 1].set_title(f"Healthy tissue mask — slice {slice_index}")
+        axes[row, 1].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(imagepath, "s0masks.png"))
+    plt.show()
 
 
 def vfa_fit(maps):
@@ -1018,7 +1401,7 @@ def vfa_fit(maps):
     vfa_array = vfa_volume.values #signal value array
     fa_deg = vfa_volume.coords[0] #flip angle should be first
     S0_max = 10 * np.amax(vfa_array) / np.sin(np.deg2rad(np.min(fa_deg))) #largest signal divided by smallest flip angle in radians
-    R1_max = 10 # corresponds to a min T1 of 0.1 should maybe change this? ask about it
+    R1_max = 40 # corresponds to a min T1 of 0.1 should maybe change this? ask about it
     bounds = ([0,0], [R1_max, S0_max])
     
     # Compute linear and save results
@@ -1483,6 +1866,7 @@ if __name__=='__main__':
     # vfa_motion_correction(DATA, MAPS)
     # vfa_fit(MAPS)
     # dce_motion_correction(DATA, MAPS)
+    #view_r1s0_slices(r1_vol, s0_vol, IMAGEPATH)
     # align_vfa_with_dce(MAPS, MASKS)
     # roi_analysis_model_based(MAPS, MASKS, IMAGEPATH)
     # roi_analysis_model_free(MAPS, MASKS, IMAGEPATH)
